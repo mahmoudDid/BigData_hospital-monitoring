@@ -1,0 +1,4 @@
+docker exec -it kafka bash
+
+// topic for the row data 
+kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic hospital_raw --partitions 4  --replication-factor 2

@@ -1,0 +1,103 @@
+# Spark image = official Spark + the 5 jars needed to read Kafka and write PostgreSQL
+x-spark: &spark
+  image: hospital-spark:${SPARK_VERSION}
+  build:
+    context: .
+    dockerfile_inline: |
+      FROM apache/spark:${SPARK_VERSION}
+      USER root
+      ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_VERSION}.jar /opt/spark/jars/
+      ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_VERSION}.jar /opt/spark/jars/
+      ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar /opt/spark/jars/
+      ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar /opt/spark/jars/
+      ADD --chmod=644 https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar /opt/spark/jars/
+      RUN mkdir -p /opt/spark-apps/checkpoints && chown -R spark:spark /opt/spark-apps
+      USER spark
+  volumes:
+    - ./spark:/opt/spark-apps/spark
+    - spark_checkpoints:/opt/spark-apps/checkpoints
+
+# Same settings for every worker; each one gets the resources set in .env
+x-spark-worker: &spark-worker
+  command: "/opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+  environment:
+    SPARK_WORKER_CORES: ${SPARK_WORKER_CORES}
+    SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY}
+  depends_on:
+    - spark-master
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:${KAFKA_VERSION}
+    container_name: kafka
+    ports:
+      - "9092:9092"   # host access (producer script)
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # Internal Docker clients use kafka:29092; Windows host clients use localhost:9092.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Single-broker settings for Kafka's internal topics and transactions.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # Use Confluent's standard data directory (also checked by its entrypoint).
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_kraft:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  nifi:
+    image: apache/nifi:${NIFI_VERSION}
+    container_name: nifi
+    ports:
+      - "8443:8443"   # NiFi UI -> https://localhost:8443/nifi
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: ${NIFI_USERNAME}
+      SINGLE_USER_CREDENTIALS_PASSWORD: ${NIFI_PASSWORD}
+      NIFI_SENSITIVE_PROPS_KEY: ${NIFI_SENSITIVE_PROPS_KEY}
+      NIFI_JVM_HEAP_MAX: ${NIFI_JVM_HEAP_MAX}
+    volumes:
+      - nifi_conf:/opt/nifi/nifi-current/conf
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # Kafdrop UI: http://localhost:9001
+  kafdrop:
+    image: obsidiandynamics/kafdrop:${KAFDROP_VERSION}
+    container_name: kafdrop
+    restart: always
+    ports:
+      - "9001:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:29092
+      JVM_OPTS: "-Xms32M -Xmx64M"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  spark-master:
+    <<: *spark
+    container_name: spark-master
+
+# Named volumes
+volumes:
+  kafka_kraft:
+  nifi_conf:
+  pgdata:
+  spark_checkpoints:
